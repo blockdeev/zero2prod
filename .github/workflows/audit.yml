@@ -5,6 +5,7 @@ on:
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+  workflow_dispatch:
   schedule:
     - cron: '0 0 * * *'
 
