@@ -7,7 +7,7 @@ async fn index() -> impl Responder {
 
 #[get("/{name}")]
 async fn hello(name: web::Path<String>) -> impl Responder {
-    format!("Hello {}!", &name)
+    format!("Hello {}!", name)
 }
 
 #[get("/health_check")]
