@@ -269,6 +269,36 @@ Middleware A
 
 Registra una **factory** (`HttpServiceFactory`) — no crea el `Service` en el momento, le da a `App` la receta para construirlo cuando haga falta (por ejemplo, cada worker thread arma su propia copia).
 
+### ⚠️ Aclaración importante: `Service` es tiempo de compilación, Tokio opera en tiempo de ejecución
+
+Es fácil confundir estas dos capas, así que vale la pena separarlas con claridad:
+
+> 🔑 **`Service` es solo una interfaz** (un trait) que el compilador usa para verificar tipos. Que un handler, un middleware o `App` "implementen `Service`" significa que el compilador puede chequear, en **tiempo de compilación**, que todos comparten la misma forma: *"recibo un request, devuelvo (async) una response"*. Es pura organización de código — el compilador verifica que todo encaje, y arma las estructuras necesarias.
+
+> 🔑 **Tokio no "maneja" `Service`s — maneja `Future`s.** Tokio es agnóstico a esta abstracción: es una capa de Actix, no de Tokio. Lo único que le importa a Tokio, un nivel más abajo, son las **futures**.
+
+Fijate bien en la firma del trait:
+
+```rust
+trait Service<Request> {
+    type Future: Future<Output = Result<Self::Response, Self::Error>>;
+    fn call(&self, req: Request) -> Self::Future;
+}
+```
+
+El método `.call()` de un `Service` **devuelve una `Future`**. La cadena real de eventos es:
+
+1. 🛠️ **Tiempo de compilación** → el compilador verifica que tu handler/middleware/`App` cumplan con el trait `Service` (tipos y firmas correctas).
+2. 🌐 **Tiempo de ejecución** → cuando llega un request real, Actix llama a `.call(req)` sobre el `Service` correspondiente, lo cual **produce una Future**.
+3. ⚙️ **Ahí entra Tokio** → el runtime toma esa Future y la poll-ea hasta que se resuelve.
+
+| Capa | Qué representa | Quién la usa |
+|---|---|---|
+| `Service` (trait) | Contrato/estructura, un contrato de tipos | El **compilador**, en tiempo de compilación |
+| `Future` | Lo que efectivamente se ejecuta y se resuelve | **Tokio**, en tiempo de ejecución (polling, scheduling) |
+
+> ✅ Tokio no "sabe" ni le importa que algo implemente `Service` — solo le importan las `Future`s que ese `Service` termina produciendo cuando se lo invoca.
+
 ---
 
 ## ✅ Resumen ejecutivo
