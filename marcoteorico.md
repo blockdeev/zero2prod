@@ -301,6 +301,189 @@ El método `.call()` de un `Service` **devuelve una `Future`**. La cadena real d
 
 ---
 
+## 9️⃣ Librería + binario: por qué separamos el proyecto en dos crates 📦
+
+Hasta ahora todo el código vivía en `src/main.rs`, compilado como **binario**. Esto tiene un límite importante cuando queremos escribir tests de integración.
+
+### El problema
+
+Los tests en la carpeta `tests/` se compilan como **binarios separados**, con exactamente el mismo nivel de acceso que tendría alguien que importa nuestro proyecto como dependencia (`use zero2prod::algo`). Pero **un binario no se puede importar como dependencia** — solo las librerías (`lib`) se pueden importar con `use`. Si toda la lógica vive únicamente en `main.rs`, los tests en `tests/` no tienen a qué apuntar: no existe ningún `zero2prod::algo` al que hacer `use`, porque no hay ninguna librería, solo un ejecutable aislado.
+
+### La solución: dos crates en el mismo `Cargo.toml`
+
+```toml
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+path = "src/main.rs"
+name = "zero2prod"
+```
+
+```
+src/
+├── lib.rs      ← TODA la lógica real vive acá (App, HttpServer, handlers, routing)
+└── main.rs      ← "entrypoint fino": solo arranca lo que expone lib.rs
+```
+
+### Cómo queda `main.rs`
+
+```rust
+use std::net::TcpListener;
+use zero2prod::run;
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:8080")
+        .expect("Failed to bind random port");
+    run(listener)?.await
+}
+```
+
+Literalmente eso — arma un listener, se lo pasa a `run()` (que vive en la librería), y lo ejecuta.
+
+### Por qué vale la pena, en concreto
+
+| Beneficio | Explicación |
+|---|---|
+| 🧪 Habilita testing real | Sin esto, no hay ningún punto de entrada al que los tests en `tests/` puedan engancharse |
+| 🛡️ `main.rs` casi imposible de romper | Cuanta menos lógica tenga el binario, menos cosas pueden fallar ahí — toda la complejidad vive en un lugar testeable |
+| ♻️ Reutilización | Si mañana se necesitara un segundo binario (por ejemplo, un CLI de administración), ambos podrían importar la misma librería sin duplicar código |
+
+---
+
+## 🔟 Concurrencia real: dentro de UNA task vs. entre VARIAS tasks 🐢🐇
+
+Este es un punto que suele confundir, así que vale la pena remarcarlo con cuidado — tiene que ver con una idea errónea común: *"Rust maneja la concurrencia automáticamente, así que un `.await` nunca debería bloquear nada más"*. Eso **no es del todo cierto**.
+
+### Lo que Rust SÍ hace bien
+
+Cuando una `Future` está esperando algo, el runtime no bloquea el *thread del sistema operativo* completo — puede cederle el procesador a **otras tasks** que también estén registradas con él.
+
+### El matiz importante: "otras tasks" no aparecen solas
+
+El runtime solo puede intercalar trabajo entre tasks que **ya existen**. Si escribimos código con varios `.await` en secuencia, dentro de la misma función, eso es **una sola task**, y dentro de ella no hay concurrencia:
+
+```rust
+async fn spawn_app() -> std::io::Result<()> {
+    zero2prod::run().await   // (A) bloquea el avance de ESTA task hasta resolverse
+}
+
+async fn health_check_works() {
+    spawn_app().await;       // (B) nunca se llega acá si (A) no termina
+    let client = /* ... */;  // (C) tampoco
+}
+```
+
+`.await` significa **"no avances más allá de este punto hasta que esta future se resuelva"** — dentro de una misma cadena secuencial, eso es indistinguible de código síncrono normal. El hecho de que el runtime *podría* aprovechar el thread libre para otra task no ayuda en nada acá, porque no existe ninguna otra task corriendo en paralelo.
+
+### Cómo se crea concurrencia real: `tokio::spawn`
+
+```rust
+fn spawn_app() {
+    let server = zero2prod::run().expect("Failed to bind address");
+    let _ = tokio::spawn(server);   // ← crea una NUEVA task, independiente
+}
+```
+
+`tokio::spawn(server)` le entrega esa future al runtime como una **task aparte**, sin esperar su resultado (a diferencia de `.await`, que sí espera). Por eso `spawn_app()` retorna casi al instante — nunca esperó a que el servidor "termine" (y un servidor HTTP, por diseño, nunca termina solo).
+
+### 🐢🐇 Metáfora para recordarlo
+
+- **Una task con varios `.await` en secuencia** = una persona haciendo una fila de trámites, uno detrás del otro. Si el trámite 1 nunca termina, nunca llega al trámite 2.
+- **Varias tasks (`tokio::spawn`)** = varias personas en filas distintas, todas atendidas por el mismo edificio (el runtime), que va salteando entre ventanillas cuando alguna persona queda esperando algo.
+
+> ✅ **Regla general:** dentro de una misma cadena de `.await` secuenciales, cada `.await` bloquea el avance de *esa* task. La concurrencia real entre piezas de trabajo distintas solo aparece cuando explícitamente creamos tasks separadas (`tokio::spawn`) o usamos combinadores como `join!`/`select!`.
+
+---
+
+## 1️⃣1️⃣ Puerto `0`: dejar que el sistema operativo elija 🎲
+
+### El problema de usar un puerto fijo en los tests
+
+```rust
+TcpListener::bind("127.0.0.1:8080")
+```
+
+Si el puerto está *hardcodeado*, dos problemas concretos aparecen:
+
+- Si el puerto ya está en uso (por ejemplo, por nuestra propia app corriendo con `cargo run` en otra terminal), el test falla.
+- Si corremos varios tests en paralelo (comportamiento por defecto de `cargo test`), todos menos uno van a fallar tratando de tomar el mismo puerto.
+
+### La solución: puerto `0`
+
+```rust
+let listener = TcpListener::bind("127.0.0.1:0")
+    .expect("Failed to bind random port");
+let port = listener.local_addr().unwrap().port();
+```
+
+El puerto `0` está **especialmente tratado a nivel del sistema operativo**: pedirle al SO que "bindee" el puerto `0` dispara una búsqueda automática de un puerto disponible, que luego se asigna a la aplicación. `listener.local_addr().unwrap().port()` nos devuelve **cuál fue el puerto real** que el SO asignó, para poder construir la URL completa y usarla en el test:
+
+```rust
+format!("http://127.0.0.1:{port}")
+```
+
+> 💡 Este patrón resuelve el problema de raíz, sin necesidad de coordinar manualmente qué puerto usa cada test — cada corrida de `cargo test` obtiene puertos frescos, sin colisiones.
+
+### ⚠️ ¿Por qué entonces `main.rs` usa un puerto fijo (`8080`) y no `0`?
+
+Vale la pena remarcar esta diferencia, porque a primera vista podría parecer inconsistente:
+
+```rust
+// main.rs — puerto FIJO
+TcpListener::bind("127.0.0.1:8080")
+
+// tests/health_check.rs — puerto ALEATORIO
+TcpListener::bind("127.0.0.1:0")
+```
+
+Son dos escenarios con necesidades opuestas:
+
+| | `main.rs` (producción) | `tests/` (testing) |
+|---|---|---|
+| **¿Quién necesita conocer el puerto?** | Clientes externos reales (navegador, `curl`, otro servicio, un balanceador de carga) | Solo el propio test, que ya lo descubre en runtime con `local_addr()` |
+| **¿Se ejecuta una sola vez o muchas en paralelo?** | Una sola instancia corriendo de forma continua | Potencialmente decenas de tests corriendo en paralelo en la misma corrida de `cargo test` |
+| **¿Importa que el puerto sea predecible?** | Sí — un cliente necesita saber de antemano a qué puerto conectarse (o depender de configuración/DNS que apunte a un puerto conocido) | No — cada test arma su propia URL dinámicamente, nadie externo necesita adivinarla |
+
+En producción, un puerto aleatorio sería un problema: ¿cómo le decís al mundo exterior a qué puerto conectarse si cambia cada vez que reiniciás el servidor? Por eso se usa un puerto **fijo y conocido**, típicamente documentado o configurable (más adelante en el libro esto se vuelve configurable vía archivo de configuración, en vez de estar hardcodeado).
+
+En testing, en cambio, el puerto es un **detalle interno y descartable**: el propio test lo pide, lo descubre (`local_addr().unwrap().port()`), arma la URL, y la usa — nadie más necesita saber cuál fue. Como además `cargo test` puede correr múltiples tests en paralelo por defecto, usar un puerto fijo ahí garantizaría colisiones; el puerto aleatorio es lo que hace posible esa paralelización sin conflictos.
+
+> ✅ **En una frase:** el puerto fijo sirve para que el mundo exterior pueda encontrar al servidor; el puerto aleatorio sirve para que los tests no se estorben entre sí.
+
+---
+
+## 1️⃣2️⃣ `rustls` vs. TLS nativo: evitar depender de OpenSSL del sistema 🔒
+
+Al agregar `reqwest` como dependencia de test (para hacer requests HTTP reales contra nuestra API), aparece una decisión de diseño relevante: **qué implementación de TLS usar**.
+
+### El problema con la opción por defecto
+
+Por defecto, `reqwest` usa el **TLS nativo del sistema operativo** — en Linux, eso significa compilar/enlazar contra **OpenSSL**, lo cual requiere tener `pkg-config` y las librerías de desarrollo de OpenSSL (`libssl-dev`) instaladas en la máquina. Si faltan, la compilación falla con errores como:
+
+```
+Could not find directory of OpenSSL installation...
+```
+
+### La alternativa: `rustls`
+
+```bash
+cargo add reqwest --dev --no-default-features --features rustls
+```
+
+`rustls` es una implementación de TLS **escrita íntegramente en Rust**, sin dependencias del sistema operativo. Se compila igual en cualquier máquina — la nuestra, la de un compañero de equipo, o el runner de GitHub Actions — sin pasos de instalación adicionales.
+
+| | TLS nativo (OpenSSL) | `rustls` |
+|---|---|---|
+| Dependencias del sistema | Sí (`pkg-config`, `libssl-dev`) | No |
+| Portabilidad | Puede fallar según el SO/distro | Compila igual en cualquier lado |
+| Origen del código | C (OpenSSL) | Rust puro |
+
+> ✅ Preferimos `rustls` por portabilidad: elimina una categoría entera de errores de compilación relacionados al entorno, tanto en desarrollo local como en CI.
+
+---
+
 ## ✅ Resumen ejecutivo
 
 | Concepto | Rol |
@@ -312,9 +495,13 @@ El método `.call()` de un `Service` **devuelve una `Future`**. La cadena real d
 | **`Future`** | Valor perezoso que necesita ser "poll-eado" para resolverse; cada `async fn` genera una |
 | **Tokio (vía `actix_web::rt`)** | El runtime que arranca la macro `#[actix_web::main]` y hace el polling de las futures |
 | **`Service`** | Abstracción común a handlers, middlewares y `App`: "recibe un request, devuelve una response async" |
+| **Librería + binario** | Separación necesaria para que los tests de integración (`tests/`) puedan importar y ejecutar la lógica real de la app |
+| **`.await` secuencial vs. `tokio::spawn`** | Un `.await` bloquea el avance de la task actual; `tokio::spawn` crea una task nueva e independiente, permitiendo concurrencia real |
+| **Puerto `0`** | Le pide al sistema operativo que asigne un puerto disponible al azar, evitando colisiones en tests |
+| **`rustls`** | Implementación de TLS en Rust puro, sin depender de OpenSSL/`pkg-config` del sistema |
 
 ---
 
 ## 📖 Fuente
 
-Basado en el estudio de *Zero To Production In Rust* (Luca Palmieri), capítulo 3, secciones 3.3.2.1 a 3.3.2.4, contrastado con `cargo expand` sobre el código actual del proyecto usando `actix-web` 4.x.
+Basado en el estudio de *Zero To Production In Rust* (Luca Palmieri), capítulo 3, secciones 3.3.2.1 a 3.5.1.2, contrastado con `cargo expand` sobre el código actual del proyecto usando `actix-web` 4.x, y con la implementación práctica del primer test de integración (`tests/health_check.rs`) usando `reqwest` + `tokio` como dev-dependencies.
