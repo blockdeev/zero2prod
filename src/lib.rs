@@ -1,15 +1,16 @@
 use actix_web::dev::Server;
 use actix_web::{App, HttpResponse, HttpServer, Responder, get};
+use std::net::TcpListener;
 
 #[get("/health_check")]
 async fn health_check() -> impl Responder {
     HttpResponse::Ok().finish()
 }
 
-pub fn run() -> Result<Server, std::io::Error> {
+pub fn run(listener: TcpListener) -> Result<Server, std::io::Error> {
     let server = HttpServer::new(|| App::new().service(health_check))
-        .bind(("127.0.0.1", 8080))?
-        .run();
+        .listen(listener)? //bind the port on our own with TcpListener
+        .run(); //and hand that over to the HttpServer using listen
 
     Ok(server)
 }
