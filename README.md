@@ -71,15 +71,26 @@ Este proyecto está separado en **librería + binario**, un patrón común en pr
 ```
 zero2prod/
 ├── src/
-│   ├── lib.rs      ← toda la lógica real: rutas, handlers, configuración del servidor
-│   └── main.rs      ← entrypoint mínimo: arma un TcpListener y arranca lo que expone lib.rs
-└── tests/
-    └── health_check.rs   ← tests de integración, le pegan a la API por HTTP real
+│   ├── lib.rs              ← declara los módulos públicos de la librería
+│   ├── main.rs              ← entrypoint mínimo: lee config, arma TcpListener + PgPool, arranca el server
+│   ├── startup.rs           ← arma App/HttpServer, registra rutas y estado compartido (PgPool)
+│   ├── configuration.rs     ← lee configuration.yaml y expone los Settings tipados
+│   └── routes/
+│       ├── mod.rs           ← re-exporta los handlers de cada archivo de ruta
+│       ├── health_check.rs  ← handler GET /health_check
+│       └── subscriptions.rs ← handler POST /subscriptions
+├── migrations/               ← migraciones SQL versionadas (generadas con sqlx-cli)
+├── scripts/
+│   └── init_db.sh            ← levanta Postgres en Docker y corre las migraciones
+├── tests/
+│   └── health_check.rs       ← tests de integración, le pegan a la API por HTTP real
+├── configuration.yaml        ← configuración de la app (puerto, datos de conexión a la DB)
+└── .env                      ← DATABASE_URL, usado por sqlx en tiempo de compilación
 ```
 
-¿Por qué separado así? Porque un binario (`main.rs`) no se puede importar como dependencia desde otro archivo. Al mover la lógica a `lib.rs`, los tests en `tests/` pueden hacer `use zero2prod::run` y levantar el servidor real para probarlo end-to-end, tal como lo haría un cliente HTTP externo.
+¿Por qué separado así? Porque un binario (`main.rs`) no se puede importar como dependencia desde otro archivo. Al mover la lógica a `lib.rs` y sus módulos, los tests en `tests/` pueden hacer `use zero2prod::startup::run` y levantar el servidor real para probarlo end-to-end, tal como lo haría un cliente HTTP externo.
 
-📖 Para una explicación más profunda de los conceptos internos (async, `Future`, el runtime Tokio, extractors, el trait `Service`), ver [`marcoteorico.md`](./marcoteorico.md).
+📖 Para una explicación más profunda de los conceptos internos (async, `Future`, el runtime Tokio, extractors, el trait `Service`, HTML forms, migraciones, `Application State`, workers de Actix, `PgPool` vs `PgConnection`), ver [`marcoteorico.md`](./marcoteorico.md).
 
 ---
 
@@ -88,6 +99,7 @@ zero2prod/
 | Método | Ruta | Descripción |
 |---|---|---|
 | `GET` | `/health_check` | Devuelve `200 OK` sin body. Usado para verificar que el servidor está vivo. |
+| `POST` | `/subscriptions` | Recibe un formulario (`application/x-www-form-urlencoded`) con `name` y `email`, y persiste un nuevo suscriptor en la base de datos. Devuelve `200 OK` si se guardó bien, `400 Bad Request` si faltan campos, `500` si falló la escritura en la DB. |
 
 ---
 
@@ -103,10 +115,75 @@ Puntos clave de cómo están armados:
 
 - Cada test arranca el servidor con `tokio::spawn`, no con `.await` directo — esto es importante, porque `.await` sobre un servidor bloquearía indefinidamente (los servidores HTTP escuchan para siempre, nunca "terminan" solos).
 - Se usa el puerto `0` al hacer el `bind`, lo cual le pide al sistema operativo que asigne un puerto disponible al azar. Esto evita colisiones si corrés varios tests en paralelo, o si el puerto fijo de producción (`8080`) ya está ocupado.
+- Cada test crea su **propia base de datos**, con un nombre aleatorio (`uuid`), y corre las migraciones sobre ella antes de arrancar el servidor. Esto aísla los tests entre sí — evita que datos guardados por un test (o una corrida anterior) interfieran con otro. Requiere que Postgres esté corriendo (ver sección de base de datos más abajo).
+
+> ⚠️ Las bases de datos de test no se eliminan automáticamente después de cada corrida (es intencional — Postgres es solo para desarrollo/test). Si se acumulan demasiadas, alcanza con reiniciar el contenedor Docker.
 
 ---
 
-## 📦 Dependencias de testing (dev-dependencies)
+## 🐘 Base de datos (PostgreSQL + Docker)
+
+Este proyecto persiste los suscriptores en una base de datos PostgreSQL. Para desarrollo local se usa un contenedor Docker, sin necesidad de instalar Postgres directamente en el sistema.
+
+### Requisitos
+
+- Docker (Docker Desktop o el daemon de Docker corriendo) — no hace falta usar la interfaz gráfica, todo se maneja por línea de comandos.
+- Cliente `psql`: `sudo apt install postgresql-client`
+- `sqlx-cli`, para gestionar migraciones:
+  ```bash
+  cargo install sqlx-cli --no-default-features --features rustls,postgres
+  ```
+
+### Levantar la base de datos
+
+```bash
+./scripts/init_db.sh
+```
+
+Este script:
+1. Verifica que `psql` y `sqlx` estén instalados.
+2. Levanta un contenedor Docker con Postgres (usuario, password, puerto y nombre de DB configurables vía variables de entorno, con valores por defecto).
+3. Espera hasta que Postgres esté listo para aceptar conexiones.
+4. Crea la base de datos y corre las migraciones pendientes (`migrations/`).
+
+Si ya tenés un Postgres dockerizado corriendo (por ejemplo, de una corrida anterior) y solo querés crear la DB/correr migraciones sin levantar un contenedor nuevo:
+
+```bash
+SKIP_DOCKER=true ./scripts/init_db.sh
+```
+
+### Migraciones
+
+Cada cambio de esquema de la base de datos vive como un archivo `.sql` versionado en `migrations/`. Para agregar una nueva:
+
+```bash
+sqlx migrate add <nombre_descriptivo>
+```
+
+📖 Más sobre qué son las migraciones y por qué se usan, en [`marcoteorico.md`](./marcoteorico.md).
+
+### Verificar la conexión (opcional)
+
+```bash
+PGPASSWORD=password psql -h localhost -U postgres -p 5432 -d newsletter -c '\dt'
+```
+
+---
+
+## 📦 Dependencias principales de la aplicación
+
+| Crate | Para qué lo usamos |
+|---|---|
+| `actix-web` | Framework web: routing, extractors, servidor HTTP |
+| `serde` (con `derive`) | (De)serialización — convierte el body de los requests (forms) en structs de Rust tipados |
+| `sqlx` (`runtime-tokio`, `tls-rustls-ring-webpki`, `macros`, `postgres`, `uuid`, `chrono`, `migrate`) | Cliente async de PostgreSQL, con validación de queries SQL en tiempo de compilación |
+| `config` | Lee `configuration.yaml` y lo convierte en structs tipados (`Settings`) |
+| `uuid` (feature `v4`) | Genera identificadores únicos (`id` de cada suscriptor) |
+| `chrono` | Maneja timestamps (`subscribed_at`) |
+
+📖 El porqué de elegir una base de datos relacional, por qué Postgres puntualmente, y por qué `sqlx` sobre otras alternativas del ecosistema Rust, están explicados en [`marcoteorico.md`](./marcoteorico.md).
+
+---
 
 Estas solo se compilan al correr `cargo test`, no forman parte del binario final:
 
@@ -148,11 +225,24 @@ Corre `cargo-audit` directamente (instalado en el runner) para detectar vulnerab
 ```bash
 git clone git@github.com:blockdeev/zero2prod.git
 cd zero2prod
+
+# 1. Levantar la base de datos (Docker + migraciones)
+./scripts/init_db.sh
+
+# 2. Levantar la app
 cargo watch -x check -x test -x run
 ```
 
-El servidor queda escuchando en `http://127.0.0.1:8080`. Podés probar el health check con:
+El servidor queda escuchando en `http://127.0.0.1:8080` (puerto leído desde `configuration.yaml`). Podés probar el health check con:
 
 ```bash
 curl -v http://127.0.0.1:8080/health_check
+```
+
+Y crear un suscriptor con:
+
+```bash
+curl -v -X POST http://127.0.0.1:8080/subscriptions \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "name=le%20guin&email=ursula_le_guin%40gmail.com"
 ```

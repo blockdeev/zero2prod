@@ -484,6 +484,221 @@ cargo add reqwest --dev --no-default-features --features rustls
 
 ---
 
+## 1️⃣3️⃣ HTML Forms, el extractor `web::Form` y el trait `FromRequest` 📝
+
+### Cómo llegan los datos de un formulario
+
+Cuando un navegador envía un formulario HTML sin JavaScript de por medio, el body del request tiene el `Content-Type: application/x-www-form-urlencoded`, con un formato tipo:
+
+```
+name=le%20guin&email=ursula_le_guin%40gmail.com
+```
+
+Pares `clave=valor` separados por `&`, con caracteres especiales *percent-encoded* (`%20` = espacio, `%40` = `@`).
+
+### El extractor `web::Form<T>`
+
+Ya vimos el concepto general de extractor (sección 4) — `web::Form<T>` es una instancia concreta, especializada en este formato:
+
+```rust
+#[derive(serde::Deserialize)]
+pub struct FormData {
+    email: String,
+    name: String,
+}
+
+#[post("/subscriptions")]
+pub async fn subscribe(form: web::Form<FormData>) -> impl Responder {
+    // form.email, form.name ya están parseados y tipados
+}
+```
+
+Como cualquier extractor, `web::Form<T>` implementa `FromRequest`. Cuando llega el request:
+
+1. Verifica que el `Content-Type` sea `application/x-www-form-urlencoded`.
+2. Parsea el body como pares clave-valor.
+3. Usa `serde::Deserialize` (por eso el `#[derive(Deserialize)]` en `FormData`) para convertir esos pares en una instancia de tu struct.
+4. Si falta algún campo requerido, o el tipo no matchea, la extracción falla — y Actix devuelve automáticamente un `400 Bad Request`, **sin que tu handler llegue a ejecutarse**.
+
+> ✅ Esto es lo que hace que nuestros tests `subscribe_returns_a_400_when_data_is_missing` pasen sin escribir ninguna validación manual — la validación de "¿están todos los campos?" la hace el extractor, antes de que tu código de negocio corra.
+
+---
+
+## 1️⃣4️⃣ ¿Por qué una base de datos relacional? ¿Por qué Postgres? 🐘
+
+### Por qué relacional
+
+El libro justifica esta elección con el tipo de datos que vamos a manejar: registros de suscriptores, con relaciones futuras (por ejemplo, suscriptores vinculados a confirmaciones de email, a newsletters enviadas, etc.). Una base de datos relacional da:
+
+- **Garantías de integridad fuertes**: constraints como `UNIQUE` (el email no se puede repetir) y `NOT NULL` se aplican a nivel de la base de datos, no solo en el código de la aplicación — una capa extra de seguridad, independiente de bugs en el código Rust.
+- **Transacciones ACID**: operaciones que se aplican todas o ninguna, útil a medida que el sistema crezca en complejidad (por ejemplo, registrar un suscriptor y encolar un email de confirmación de forma atómica).
+- **Un modelo de datos maduro y bien entendido**, con décadas de herramientas, tooling y prácticas alrededor.
+
+### Por qué Postgres puntualmente
+
+El libro elige Postgres (en vez de MySQL, SQLite, u otras) por:
+
+- Es **open source**, gratuito, y ampliamente adoptado en la industria — mucha documentación y soporte comunitario.
+- Tiene un **ecosistema Rust maduro**: los drivers y crates disponibles para Postgres (como `sqlx`) suelen ser los más completos y activamente mantenidos del ecosistema.
+- Soporta **tipos de datos ricos** (UUID nativo, JSON, arrays, etc.) que encajan bien con lo que necesitamos (por ejemplo, la columna `id uuid` de nuestra tabla `subscriptions`).
+
+---
+
+## 1️⃣5️⃣ ¿Por qué `sqlx` y no otra librería? 🦀
+
+El ecosistema Rust tiene varias opciones para hablar con bases de datos. Las alternativas más conocidas junto a `sqlx` son `diesel` (un ORM) y `tokio-postgres` (un driver de bajo nivel). El libro elige `sqlx` por una combinación de características poco común:
+
+| Característica | Qué aporta |
+|---|---|
+| **Async nativo** | A diferencia de `diesel` (que históricamente era síncrono), `sqlx` es async desde el diseño — encaja naturalmente con Actix Web/Tokio |
+| **Sin ORM, SQL directo** | No hay una capa de abstracción que "traduzca" tu código a SQL — escribís SQL real, dentro de macros como `sqlx::query!` |
+| **Validación en tiempo de compilación** | `sqlx::query!` se conecta a la base de datos real durante `cargo build`/`cargo check` para verificar que la consulta sea válida (columnas existentes, tipos compatibles) — errores de SQL se detectan **antes** de correr el programa, no en runtime |
+| **No requiere un runtime propio separado** | Corre sobre el runtime async que ya tenés (Tokio), sin imponer uno adicional |
+
+> ✅ En criollo: `sqlx` da la seguridad de tipos que buscarías en un ORM, sin esconder el SQL detrás de una capa de abstracción — el mejor punto medio entre control y seguridad para este tipo de proyecto.
+
+---
+
+## 1️⃣6️⃣ Sobre `scripts/init_db.sh`: qué hace y por qué existe 🐳
+
+Ya vimos línea por línea las tres primeras líneas del script (`set -x`, `set -eo pipefail`) en el chat de estudio, pero vale la pena remarcar el **propósito general** del archivo acá:
+
+### El problema que resuelve
+
+Levantar un entorno de desarrollo con base de datos implica varios pasos manuales: levantar un contenedor Docker con Postgres, esperar a que esté listo para aceptar conexiones, crear la base de datos, y correr las migraciones. Hacerlo a mano cada vez es tedioso y propenso a errores (olvidarse un paso, tipear mal un flag).
+
+### Qué automatiza el script
+
+1. **Verifica dependencias** (`psql`, `sqlx`) antes de arrancar, fallando temprano con un mensaje claro si falta algo.
+2. **Levanta Postgres en Docker**, con parámetros configurables vía variables de entorno (usuario, password, puerto, nombre de DB), con valores por defecto razonables.
+3. **Espera activamente** a que Postgres esté listo — reintentando una conexión de prueba (`psql ... -c '\q'`) en un loop, en vez de asumir un tiempo fijo de espera (que podría ser insuficiente en una máquina lenta, o innecesariamente largo en una rápida).
+4. **Crea la base de datos y corre las migraciones**, dejando el entorno listo para trabajar con un solo comando.
+5. Permite **saltear el paso de Docker** (`SKIP_DOCKER=true`) para reutilizarse en contextos donde Postgres ya está corriendo por otro medio (por ejemplo, un service container en CI).
+
+> ✅ Es el mismo principio detrás del pipeline de CI: automatizar pasos repetitivos y propensos a error, para que "levantar el entorno" sea un comando reproducible, no una lista de instrucciones que hay que recordar.
+
+---
+
+## 1️⃣7️⃣ Migraciones de base de datos: qué son y por qué versionarlas 🗂️
+
+Una **migración** es un archivo que describe un cambio incremental en la estructura (schema) de la base de datos — crear una tabla, agregar una columna, modificar un tipo de dato.
+
+### La analogía con Git
+
+Así como Git versiona cambios en el código, las migraciones versionan cambios en la **estructura** de la base de datos: cada migración es un paso ordenado cronológicamente, que lleva la base de datos de un estado conocido al siguiente.
+
+### Por qué no alcanza con ejecutar SQL "a mano"
+
+Sin migraciones, no hay forma confiable de saber **qué cambios ya se aplicaron** en cada entorno (tu máquina, la de un compañero, el pipeline de CI, producción). Con migraciones:
+
+- Cada cambio queda en un archivo `.sql`, con nombre único y timestamp.
+- La herramienta (`sqlx-cli` en nuestro caso) lleva un registro de qué migraciones ya corrieron contra esa base de datos específica.
+- `sqlx migrate run` aplica **solo las pendientes**, en orden, nunca repite una ya aplicada.
+
+### Cómo se usa en este proyecto
+
+- En desarrollo local: `scripts/init_db.sh` corre `sqlx migrate run` como parte del setup.
+- En los tests de integración: la función `configure_database` usa `sqlx::migrate!("./migrations")` — la misma lógica, pero invocada directamente desde Rust en vez de un comando de shell, para poder aplicar las migraciones sobre la base de datos temporal y aislada de cada test.
+
+---
+
+## 1️⃣8️⃣ Application State en Actix Web y `app_data` 🗃️
+
+Hasta el capítulo de forms, nuestra aplicación era completamente *stateless* (sin estado): cada handler trabajaba únicamente con los datos del request entrante, sin necesitar nada "compartido" entre requests.
+
+### El problema: los handlers necesitan una conexión a la base de datos
+
+Para persistir un suscriptor, el handler `subscribe` necesita acceso a algo que **no viene en el request** — una conexión (o pool de conexiones) a Postgres. Ese recurso se crea **una vez**, al arrancar la aplicación, y se necesita **compartir** entre todos los requests que lleguen después.
+
+### La solución: `app_data`
+
+Actix Web permite adjuntar datos a la aplicación que no están ligados al ciclo de vida de un único request — el **application state**. Se agrega con el método `.app_data(...)` sobre `App`:
+
+```rust
+App::new()
+    .app_data(db_pool.clone())
+    // ...
+```
+
+Cualquier handler puede después "pedir" ese estado como parámetro, usando el extractor `web::Data<T>` (lo vemos en detalle en la sección 20).
+
+---
+
+## 1️⃣9️⃣ Los *workers* de Actix Web: una copia de la app por núcleo 🏭
+
+### El modelo de Actix
+
+Cuando llamás `HttpServer::new(closure)`, **no le estás pasando directamente una `App`** — le pasás un **closure que devuelve** una `App`. Esto es clave para entender por qué existe el problema que resolvemos en la próxima sección.
+
+Actix Web arranca **un worker (proceso/hilo) por cada núcleo disponible en tu máquina**. Cada worker corre **su propia copia** de la aplicación, construida invocando ese mismo closure que le pasaste a `HttpServer::new`.
+
+```rust
+HttpServer::new(move || {
+    App::new()
+        .service(health_check)
+        .service(subscribe)
+        .app_data(db_pool.clone())
+})
+```
+
+Este closure se llama **una vez por worker** — si tu máquina tiene 8 núcleos, Actix va a invocarlo 8 veces, generando 8 instancias independientes de `App`, cada una corriendo en su propio worker, procesando requests en paralelo.
+
+### Por qué esto importa para el estado compartido
+
+Como cada worker tiene su **propia copia** de todo lo que hay dentro del closure, cualquier recurso que quieras compartir entre workers (como la conexión a la base de datos) tiene que poder **clonarse** — cada copia de `App` necesita su propia referencia a ese recurso. Esto explica por qué `db_pool.clone()` aparece explícitamente en el código: no es un detalle cosmético, es un requisito estructural del modelo de workers de Actix.
+
+---
+
+## 2️⃣0️⃣ `web::Data`, `Arc`, y el mecanismo de *type-map*: cómo Actix hace "dependency injection" 📌
+
+### El problema con `PgConnection` y `Clone`
+
+Si intentás poner un `PgConnection` directo dentro de `app_data`, el compilador se queja: `HttpServer` exige que todo lo que va dentro del closure sea `Clone` (porque, como vimos, cada worker necesita su propia copia). `PgConnection` **no implementa `Clone`** — tiene sentido, porque por debajo representa un socket TCP real hacia Postgres, y no hay forma sensata de "duplicar" una conexión de red activa.
+
+### La solución: envolver el recurso en `web::Data`
+
+```rust
+let db_pool = web::Data::new(db_pool);
+```
+
+`web::Data<T>` envuelve tu valor en un **`Arc`** (*Atomic Reference Counted pointer*, un puntero con conteo de referencias atómico). En vez de que cada worker reciba una copia cruda del recurso, cada uno recibe un **puntero** a la misma instancia compartida en memoria.
+
+> ✅ **Dato clave: `Arc<T>` siempre es `Clone`, sin importar si `T` lo es o no.** Clonar un `Arc` no clona el valor de adentro — solo incrementa un contador interno de referencias activas y devuelve una nueva copia de la dirección de memoria. Por eso `db_pool.clone()` funciona perfecto aunque `PgPool`/`PgConnection` no sean clonables por sí mismos.
+
+### Cómo `web::Data<T>` "encuentra" el dato correcto: el *type-map*
+
+Acá está el mecanismo interno, que es genuinamente interesante:
+
+Actix Web representa su estado de aplicación como un **type-map**: un `HashMap` que guarda datos arbitrarios (usando el tipo `Any` de Rust), indexados por su **`TypeId`** — un identificador único que Rust genera para cada tipo distinto en tu programa.
+
+Cuando llega un request y tu handler pide `web::Data<PgPool>` como parámetro:
+
+1. Actix calcula el `TypeId` correspondiente a `PgPool` (el tipo que especificaste en la firma del handler).
+2. Busca en el type-map si hay un registro guardado con ese `TypeId` (lo hubo, porque lo registraste con `.app_data(db_pool.clone())`).
+3. Si lo encuentra, hace un *downcast* del valor `Any` recuperado de vuelta al tipo concreto (`PgPool`) — seguro, porque el `TypeId` garantiza que no hay ambigüedad de tipos.
+4. Se lo entrega a tu handler, ya listo para usar.
+
+### Por qué esto se parece a "dependency injection"
+
+En otros ecosistemas (Java/Spring, C#/.NET), este patrón — pedir una dependencia como parámetro y que el framework te la resuelva automáticamente, sin que vos la construyas a mano dentro del handler — se conoce como **inyección de dependencias**. `web::Data` logra algo funcionalmente equivalente, aunque el mecanismo interno (type-map + `TypeId`) es una solución particular de Rust, aprovechando que el sistema de tipos permite identificar y recuperar valores de forma segura en runtime.
+
+---
+
+## 2️⃣1️⃣ `PgConnection` vs. `PgPool`: repaso con caso de uso real 🔌
+
+Ya vimos la diferencia teórica (sección 15 del capítulo anterior tocaba `Executor`) — acá el repaso aplicado a un caso concreto que resolvimos en este proyecto: `configure_database`, la función que prepara una base de datos nueva para cada test.
+
+| | `PgConnection` | `PgPool` |
+|---|---|---|
+| Qué es | Una única conexión TCP a Postgres | Un conjunto administrado de conexiones, que se piden y devuelven según demanda |
+| ¿Es `Clone`? | No — representa un recurso de sistema único | No directamente, pero se comparte fácilmente envuelto en `web::Data`/`Arc` |
+| ¿Soporta queries concurrentes? | No — solo `&mut PgConnection` implementa `Executor`, exclusividad forzada por el compilador | Sí — `&PgPool` implementa `Executor`; el pool presta una conexión libre (o crea/espera una) por cada query |
+| Cuándo la usamos en este proyecto | Tarea administrativa puntual: conectarse al servidor (sin apuntar a una DB específica) y ejecutar `CREATE DATABASE` — la base de datos todavía no existe, no hay nada que "poolear" todavía | Todo el resto: correr migraciones, atender requests de la aplicación real, hacer el `SELECT` de verificación en los tests |
+
+> ✅ Regla práctica: `PgConnection` para una operación administrativa aislada y puntual (crear algo que no existe); `PgPool` para cualquier escenario donde la aplicación necesite atender múltiples operaciones concurrentes sobre una base de datos que ya existe.
+
+---
+
 ## ✅ Resumen ejecutivo
 
 | Concepto | Rol |
@@ -499,9 +714,16 @@ cargo add reqwest --dev --no-default-features --features rustls
 | **`.await` secuencial vs. `tokio::spawn`** | Un `.await` bloquea el avance de la task actual; `tokio::spawn` crea una task nueva e independiente, permitiendo concurrencia real |
 | **Puerto `0`** | Le pide al sistema operativo que asigne un puerto disponible al azar, evitando colisiones en tests |
 | **`rustls`** | Implementación de TLS en Rust puro, sin depender de OpenSSL/`pkg-config` del sistema |
+| **`web::Form<T>` / `FromRequest`** | Extractor que parsea y valida un formulario HTML (`x-www-form-urlencoded`) contra un struct, devolviendo `400` automáticamente si faltan campos |
+| **Postgres + `sqlx`** | DB relacional por sus garantías de integridad; `sqlx` por ser async nativo, sin ORM, con validación de queries en tiempo de compilación |
+| **Migraciones** | Cambios de schema versionados y ordenados, aplicados una sola vez, trackeados por la herramienta (`sqlx-cli` / `sqlx::migrate!`) |
+| **Application State / `app_data`** | Mecanismo para compartir recursos (como una conexión a DB) entre todos los handlers, fuera del ciclo de vida de un único request |
+| **Workers de Actix** | Un proceso por núcleo de la máquina, cada uno con su propia copia de `App`, construida invocando el mismo closure |
+| **`web::Data` + `Arc` + type-map** | Envuelve un recurso no clonable en un `Arc` (siempre clonable); Actix lo recupera vía `TypeId` en un `HashMap` interno — un patrón similar a "dependency injection" |
+| **`PgConnection` vs. `PgPool`** | Conexión única para tareas administrativas puntuales (crear una DB); pool para todo lo que requiera concurrencia real |
 
 ---
 
 ## 📖 Fuente
 
-Basado en el estudio de *Zero To Production In Rust* (Luca Palmieri), capítulo 3, secciones 3.3.2.1 a 3.5.1.2, contrastado con `cargo expand` sobre el código actual del proyecto usando `actix-web` 4.x, y con la implementación práctica del primer test de integración (`tests/health_check.rs`) usando `reqwest` + `tokio` como dev-dependencies.
+Basado en el estudio de *Zero To Production In Rust* (Luca Palmieri), capítulos 3 completo (Sign Up A New Subscriber: extractors, HTML forms, `sqlx`, `PgPool`, aislamiento de tests), contrastado con `cargo expand` sobre el código actual del proyecto usando `actix-web` 4.x, y adaptado a versiones actuales de `sqlx` (0.9), `config`, `uuid` y `chrono`.
